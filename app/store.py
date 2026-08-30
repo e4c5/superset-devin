@@ -43,7 +43,9 @@ CREATE TABLE IF NOT EXISTS issues (
     structured_output TEXT,
     created_at     REAL NOT NULL,
     updated_at     REAL NOT NULL,
-    terminal_at    REAL
+    terminal_at    REAL,
+    next_poll_at   REAL,
+    poll_attempts  INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_issues_devin_id ON issues(devin_id)
     WHERE devin_id IS NOT NULL;
@@ -60,6 +62,12 @@ CREATE TABLE IF NOT EXISTS dedup_events (
     created_at    REAL NOT NULL
 );
 """
+
+#: Columns added after the initial schema; applied to existing databases on init.
+_ADDED_COLUMNS = (
+    "next_poll_at REAL",
+    "poll_attempts INTEGER NOT NULL DEFAULT 0",
+)
 
 
 @dataclass
@@ -90,6 +98,21 @@ class Store:
         self._local = threading.local()
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+            self._migrate(conn)
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Add columns missing from a database created by an earlier schema.
+
+        ``CREATE TABLE IF NOT EXISTS`` leaves an existing ``state.db`` volume on
+        its old shape, so every added column needs an explicit ``ALTER TABLE``.
+        """
+        for column in _ADDED_COLUMNS:
+            try:
+                conn.execute(f"ALTER TABLE issues ADD COLUMN {column}")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
 
     def _connect(self) -> sqlite3.Connection:
         conn = getattr(self._local, "conn", None)
@@ -172,7 +195,8 @@ class Store:
                     "UPDATE issues SET issue_number = ?, rule = ?, file = ?, lines = ?, message = ?,"
                     " status = 'pending', status_detail = NULL, outcome = ?, session_id = NULL,"
                     " devin_id = NULL, tags = '[]', pr_url = NULL, acus_consumed = 0,"
-                    " structured_output = NULL, terminal_at = NULL, created_at = ?,"
+                    " structured_output = NULL, terminal_at = NULL, next_poll_at = NULL,"
+                    " poll_attempts = 0, created_at = ?,"
                     " updated_at = ? WHERE finding_key = ?",
                     (issue_number, rule, file, lines, message, NON_TERMINAL_OUTCOME, now, now, finding_key),
                 )
@@ -221,7 +245,8 @@ class Store:
                 "UPDATE issues SET issue_number = ?, rule = ?, file = ?, lines = ?, message = ?,"
                 " status = 'pending', status_detail = NULL, outcome = ?, session_id = NULL,"
                 " devin_id = NULL, tags = '[]', pr_url = NULL, acus_consumed = 0,"
-                " structured_output = NULL, terminal_at = NULL, created_at = ?, updated_at = ?"
+                " structured_output = NULL, terminal_at = NULL, next_poll_at = NULL,"
+                " poll_attempts = 0, created_at = ?, updated_at = ?"
                 " WHERE finding_key = ? AND updated_at = ?",
                 (issue_number, rule, file, lines, message, NON_TERMINAL_OUTCOME, now, now,
                  finding_key, expected_updated_at),

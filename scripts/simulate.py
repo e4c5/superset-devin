@@ -28,7 +28,11 @@ from app.metrics import build_metrics, render_report  # noqa: E402
 from app.orchestrator import Orchestrator  # noqa: E402
 from app.poller import Poller  # noqa: E402
 from app.store import Store  # noqa: E402
-from simulator.demo_issues import DEMO_FINDINGS, issue_payload  # noqa: E402
+from simulator.demo_issues import (  # noqa: E402
+    DEMO_FINDINGS,
+    issue_payload,
+    pull_request_payload,
+)
 from simulator.fake_devin import FakeDevinAPI, FakeGitHubAPI, Scenario  # noqa: E402
 
 SECRET = "simulated-webhook-secret"
@@ -60,9 +64,9 @@ SCENARIOS = {
         acus=1.8,
         fail_get_on_tick=2,
     ),
-    # 3. Straightforward fix.
+    # 3. Straightforward fix, settled by its pull_request webhook rather than a poll.
     "devin-s6440-issue-103": Scenario(
-        ticks_to_terminal=2, structured_output=pr("typescript:S6440", 3103), acus=2.1
+        ticks_to_terminal=1, structured_output=pr("typescript:S6440", 3103), acus=2.1
     ),
     # 4. Cost cap reached: blocked_on_budget, NOT a Devin defect.
     "devin-s6440-issue-104": Scenario(
@@ -106,6 +110,10 @@ async def main() -> int:
         session_max_wait_seconds=3600,
         database_path=os.path.join(workdir, "state.db"),
         report_path=os.path.join(workdir, "report.md"),
+        # Compressed backoff so a run that would take minutes of wall clock in
+        # production finishes in a second here; the schedule itself is the same.
+        poll_backoff_base_seconds=0,
+        poll_backoff_cap_seconds=0,
     )
 
     fake_devin = FakeDevinAPI(org_id=ORG_ID, scenarios=SCENARIOS)
@@ -129,6 +137,8 @@ async def main() -> int:
         interval_seconds=settings.poll_interval_seconds,
         max_wait_seconds=settings.session_max_wait_seconds,
         max_acu_limit=settings.max_acu_limit,
+        backoff_base_seconds=settings.poll_backoff_base_seconds,
+        backoff_cap_seconds=settings.poll_backoff_cap_seconds,
     )
     orchestrator = Orchestrator(
         settings=settings, store=store, devin=devin, github=github, poller=None
@@ -180,6 +190,17 @@ async def main() -> int:
     closed = issue_payload(DEMO_FINDINGS[1], number=108)
     closed["action"] = "closed"
     await deliver(closed, "issue #108 closed event")
+
+    # --- the happy path resolves on the pull_request webhook, not on a poll --
+    # (the poller is attached only here so the simulation drives every tick itself)
+    orchestrator.poller = poller
+    pr_payload = pull_request_payload(103, number=3103)
+    handle, reason = orchestrator.should_handle_pull_request(pr_payload)
+    print(f"\n>>> pull_request opened for issue #103 -> "
+          f"{'accepted' if handle else 'ignored: ' + reason}")
+    if handle:
+        result = await orchestrator.handle_pull_request_event(pr_payload)
+        print(f"    immediate check: {result}")
 
     # --- poll to completion ------------------------------------------------
     print("\n>>> polling sessions to terminal state")

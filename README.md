@@ -18,7 +18,11 @@ GitHub issue (label: devin-fix)
         POST /v3/organizations/{org}/sessions   (devin_id=devin-s6440-issue-<n>)
                      │            └── 409 ─► fetch existing session, continue
                      ▼
-                  poller  ──►  GET .../sessions/{devin_id}  every POLL_INTERVAL_SECONDS
+                  poller  ──►  GET .../sessions/{devin_id}  after a per-session gap
+                     ▲                (30s, doubling up to POLL_BACKOFF_CAP_SECONDS)
+                     │
+   pull_request webhook (opened | reopened | ready_for_review, HMAC verified)
+   ──► one immediate GET for the issue the PR references
                      │
                      ▼
    succeeded / declined / failed / blocked_on_budget / timed_out
@@ -27,8 +31,10 @@ GitHub issue (label: devin-fix)
         structured logs + GET /status + report.md
 ```
 
-There is **no batch scan step**. The only way work starts is an `issues`
-webhook, so the demo is driven entirely by filing tickets on camera.
+There is **no batch scan step**. The only way work *starts* is an `issues`
+webhook, so the demo is driven entirely by filing tickets on camera. A
+`pull_request` webhook never starts anything — it only settles a session that is
+already being tracked.
 
 ## What is where
 
@@ -108,7 +114,10 @@ On `e4c5/superset` → Settings → Webhooks → Add webhook:
 | Payload URL | `https://superset-devin.loca.lt/webhook` |
 | Content type | `application/json` |
 | Secret | the same string as `GITHUB_WEBHOOK_SECRET` |
-| Events | *Let me select individual events* → **Issues** only |
+| Events | *Let me select individual events* → **Issues** and **Pull requests** |
+
+`Pull requests` is optional: without it everything still resolves on the poll,
+just later. Any other event type is acknowledged with 200 and dropped.
 
 Then create the `devin-fix` label on the repo. Issues without that label are
 acknowledged with 200 and ignored — the gate is enforced server-side, not by
@@ -159,7 +168,9 @@ It replays the five demo findings plus:
   `devin_id` → the API returns **409** and the client reuses the session.
 - an **unlabeled** issue and a **closed** action → both ignored.
 - a **429** on create → retried with backoff.
-- a **503** on a poll → session stays `in_progress`, retried next tick (never mis-marked failed).
+- a **503** on a poll → session stays `in_progress`, retried next tick (never mis-marked failed,
+  and never pushed onto the long backoff — an unreachable API is not a quiet session).
+- issue #103's **`pull_request` webhook** → settled by one immediate `get_session`, with no poll.
 - a session stopped by the ACU cap → `blocked_on_budget`, not `failed`.
 - the ECharts false positive → `declined` with a reason, no PR.
 
@@ -180,7 +191,7 @@ Expected tail of the run:
 ## Tests
 
 ```bash
-make test    # 30 tests
+make test    # 46 tests
 make lint
 ```
 
@@ -188,7 +199,9 @@ They cover HMAC rejection, the label/action/event gate, markdown parsing and the
 `(file, rule)` fallback, concurrent claims of the same finding, 409 reuse, 429
 retry, 5xx exhaustion, non-retryable 401/403/422, the create-request contract,
 every outcome bucket, transient-poll-failure-is-not-failure, timeout, restart
-rehydration, and the metrics rollup.
+rehydration, the widening-and-capped poll gap, the `pull_request` webhook
+finalizing a record exactly once (and a poll tick not repeating it), and the
+metrics rollup.
 
 ## Design notes
 
@@ -198,6 +211,20 @@ wiped, the Devin API answers `409` and we adopt the existing session. The same
 defect filed as two issues is caught by the SonarQube issue key (falling back to
 `(file, rule)`), which is a `PRIMARY KEY` claimed under `BEGIN IMMEDIATE`, so two
 simultaneous webhooks cannot both win the check-and-insert.
+
+**How completion is detected.** The poller is the source of truth and the
+backstop; nothing else writes a terminal outcome. It wakes every
+`POLL_INTERVAL_SECONDS` but each session carries its own `next_poll_at`, widened
+to `min(POLL_BACKOFF_BASE_SECONDS * 2**attempts, POLL_BACKOFF_CAP_SECONDS)` after
+every poll that finds the session still running — so an hour-long session costs a
+handful of GETs rather than 120. The `pull_request` webhook is a low-latency
+shortcut on the happy path only: it maps the PR back to the issue it references,
+and if that record is still non-terminal it runs one `get_session` through the
+same `classify` → `store.update` → finalize path a poll tick would. Both paths
+re-read the record before finalizing, so a webhook racing a tick reports once.
+Outcomes with no event to hang off (`declined`, `blocked_on_budget`, `failed`)
+simply resolve on the slower poll, and `SESSION_MAX_WAIT_SECONDS` still force-
+resolves a silent session as `timed_out`.
 
 **Unreachable ≠ errored.** The poller only marks a session `failed` when the API
 *reports* `status == "error"`. A network error or 5xx on the GET leaves the

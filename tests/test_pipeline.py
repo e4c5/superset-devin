@@ -24,7 +24,7 @@ from app.orchestrator import Orchestrator
 from app.poller import Poller, classify
 from app.store import STALE_CLAIM_SECONDS, Store
 from app.webhook import build_app, verify_signature
-from simulator.demo_issues import DEMO_FINDINGS, issue_payload
+from simulator.demo_issues import DEMO_FINDINGS, issue_payload, pull_request_payload
 from simulator.fake_devin import FakeDevinAPI, FakeGitHubAPI, Scenario
 
 ORG = "org-test"
@@ -71,6 +71,10 @@ def build_stack(tmp_path, scenarios=None, client_max_retries=5, **overrides):
         interval_seconds=1,
         max_wait_seconds=settings.session_max_wait_seconds,
         max_acu_limit=settings.max_acu_limit,
+        # No gap between polls unless a test is specifically about the backoff, so a
+        # test loop keeps its one-poll-per-tick cadence.
+        backoff_base_seconds=0.0,
+        backoff_cap_seconds=0.0,
     )
     return settings, store, orch, poller, fake_devin, fake_github
 
@@ -617,6 +621,64 @@ async def test_poller_transient_failure_does_not_mark_failed(tmp_path):
     assert record["pr_url"] == "https://pr/1"
 
 
+# --------------------------------------------------------------------------
+# variable-gap polling
+# --------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_backoff_widens_the_gap_per_attempt_and_caps_it(tmp_path):
+    scenarios = {"devin-s6440-issue-101": Scenario(ticks_to_terminal=10_000)}
+    settings, store, orch, _, fake_devin, _ = build_stack(tmp_path, scenarios=scenarios)
+    poller = Poller(
+        store=store,
+        client=DevinClient(base_url=settings.devin_api_base, org_id=ORG, token="cog_test",
+                           transport=fake_devin.transport(), backoff_base=0.001),
+        interval_seconds=1,
+        max_wait_seconds=settings.session_max_wait_seconds,
+        max_acu_limit=settings.max_acu_limit,
+        backoff_base_seconds=10,
+        backoff_cap_seconds=40,
+    )
+    await orch.handle_issue_event(issue_payload(DEMO_FINDINGS[0]))
+    key = store.all_records()[0]["finding_key"]
+    assert store.get(key)["next_poll_at"] is None, "a never-polled record is due now"
+
+    for attempt, expected_gap in enumerate([10, 20, 40, 40], start=1):
+        before = time.time()
+        await poller.tick()
+        record = store.get(key)
+        assert record["poll_attempts"] == attempt
+        assert record["next_poll_at"] - before == pytest.approx(expected_gap, abs=1.0)
+        store.update(key, next_poll_at=before - 1)  # make it due again
+
+    # A record whose gap has not elapsed is skipped entirely.
+    store.update(key, next_poll_at=time.time() + 3600)
+    gets = sum(1 for method, _ in fake_devin.requests if method == "GET")
+    await poller.tick()
+    assert sum(1 for method, _ in fake_devin.requests if method == "GET") == gets
+
+
+@pytest.mark.asyncio
+async def test_transient_poll_failure_is_retried_without_backoff(tmp_path):
+    scenarios = {"devin-s6440-issue-101": Scenario(ticks_to_terminal=10_000, fail_get_on_tick=1)}
+    settings, store, orch, _, fake_devin, _ = build_stack(
+        tmp_path, scenarios=scenarios, client_max_retries=1
+    )
+    poller = Poller(
+        store=store,
+        client=DevinClient(base_url=settings.devin_api_base, org_id=ORG, token="cog_test",
+                           transport=fake_devin.transport(), max_retries=1, backoff_base=0.001),
+        interval_seconds=1, max_wait_seconds=3600, max_acu_limit=10,
+        backoff_base_seconds=600, backoff_cap_seconds=600,
+    )
+    await orch.handle_issue_event(issue_payload(DEMO_FINDINGS[0]))
+
+    await poller.tick()  # 503: an unreachable API is not a quiet session
+    record = store.get_by_issue(101)
+    assert record["status"] == "polling"
+    assert record["poll_attempts"] == 0
+    assert record["next_poll_at"] is None, "still due on the very next tick"
+
+
 @pytest.mark.asyncio
 async def test_poller_times_out_stuck_session(tmp_path):
     scenarios = {"devin-s6440-issue-101": Scenario(ticks_to_terminal=10_000)}
@@ -687,6 +749,140 @@ async def test_metrics_rollup(tmp_path):
     assert metrics["total_acus"] == 6.0
     assert metrics["cost_per_fix_acus"] == 6.0
     assert metrics["dedup_skips"] == 1
+
+
+# --------------------------------------------------------------------------
+# pull_request webhook as a low-latency completion signal
+# --------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_pull_request_webhook_finalizes_once_and_poll_does_not_repeat_it(tmp_path):
+    settings, store, orch, _, fake_devin, _ = build_stack(tmp_path)
+    # Devin opens the PR and then idles in waiting_for_user; the backed-off poll
+    # would not look again for another ten minutes.
+    fake_devin.default_scenario = Scenario(
+        ticks_to_terminal=10,
+        acus=50.0,  # the fake ramps ACUs, so the first poll snapshots 5.0
+        pr_on_tick=1,
+        structured_output={"fixed": True, "rule": "typescript:S6440",
+                           "pr_url": "https://github.com/e4c5/superset/pull/900",
+                           "summary": "", "reason": ""},
+    )
+    terminal_calls: list = []
+    poller = Poller(
+        store=store,
+        client=DevinClient(base_url=settings.devin_api_base, org_id=ORG, token="cog_test",
+                           transport=fake_devin.transport(), backoff_base=0.001),
+        interval_seconds=1,
+        max_wait_seconds=settings.session_max_wait_seconds,
+        max_acu_limit=settings.max_acu_limit,
+        backoff_base_seconds=600,
+        backoff_cap_seconds=600,
+        terminal_on_pr=True,
+        on_terminal=terminal_calls.append,
+    )
+    orch.poller = poller
+    await orch.handle_issue_event(issue_payload(DEMO_FINDINGS[0]))
+
+    result = await orch.handle_pull_request_event(pull_request_payload(101))
+
+    assert result["outcome"] == "succeeded"
+    record = store.get_by_issue(101)
+    assert record["outcome"] == "succeeded"
+    assert record["pr_url"].endswith("/pull/900")
+    assert record["acus_consumed"] == 5.0
+    assert record["terminal_at"] is not None
+    assert len(terminal_calls) == 1
+    gets = sum(1 for method, _ in fake_devin.requests if method == "GET")
+    assert gets == 1, "one get_session snapshots ACUs and structured output"
+
+    # A poll tick racing the webhook must not report the same record again.
+    assert store.non_terminal() == []
+    await poller.tick()
+    assert len(terminal_calls) == 1
+    assert sum(1 for method, _ in fake_devin.requests if method == "GET") == gets
+
+    # ...and neither may a redelivered pull_request webhook.
+    repeat = await orch.handle_pull_request_event(pull_request_payload(101))
+    assert repeat["status"] == "already_terminal"
+    assert len(terminal_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_pull_request_gate_rejects_foreign_repo_actions_and_unknown_issues(tmp_path):
+    _, _, orch, _, _, _ = build_stack(tmp_path)
+    await orch.handle_issue_event(issue_payload(DEMO_FINDINGS[0]))
+
+    handled, reason = orch.should_handle_pull_request(
+        pull_request_payload(101, repo="attacker/evil")
+    )
+    assert not handled and "attacker/evil" in reason
+
+    handled, reason = orch.should_handle_pull_request(pull_request_payload(101, action="closed"))
+    assert not handled and "action=closed" in reason
+
+    handled, reason = orch.should_handle_pull_request(pull_request_payload(999))
+    assert not handled and "no tracked issue" in reason
+
+    assert orch.should_handle_pull_request(pull_request_payload(101))[0]
+
+
+def test_pull_request_webhook_endpoint_resolves_the_happy_path(tmp_path):
+    settings, store, _, _, fake_devin, fake_github = build_stack(
+        tmp_path, poll_backoff_base_seconds=600, poll_backoff_cap_seconds=600
+    )
+    fake_devin.default_scenario = Scenario(
+        ticks_to_terminal=10_000,
+        acus=3.0,
+        pr_on_tick=2,
+        structured_output={"fixed": True, "rule": "typescript:S6440",
+                           "pr_url": "https://github.com/e4c5/superset/pull/900",
+                           "summary": "", "reason": ""},
+    )
+    app = build_app(
+        settings,
+        devin_client=DevinClient(
+            base_url=settings.devin_api_base, org_id=ORG, token="cog_test",
+            transport=fake_devin.transport(), backoff_base=0.001,
+        ),
+        github_client=GitHubClient(token="ghp_test", repo=settings.target_repo,
+                                   transport=fake_github.transport()),
+        store=store,
+        start_poller=False,
+    )
+    with TestClient(app) as client:
+        def post(payload, event, sign=True):
+            body = json.dumps(payload).encode()
+            headers = {"X-GitHub-Event": event, "X-GitHub-Delivery": "d1"}
+            if sign:
+                headers["X-Hub-Signature-256"] = (
+                    "sha256=" + hmac.new(SECRET.encode(), body, hashlib.sha256).hexdigest()
+                )
+            return client.post("/webhook", content=body, headers=headers)
+
+        assert post(issue_payload(DEMO_FINDINGS[0]), "issues").json()["status"] == "accepted"
+        assert store.get_by_issue(101)["outcome"] == "in_progress"
+
+        # Wait out the background poller's first look: it finds a session that is
+        # still running and backs off for ten minutes.
+        deadline = time.time() + 5
+        while not store.get_by_issue(101)["poll_attempts"] and time.time() < deadline:
+            time.sleep(0.02)
+        assert store.get_by_issue(101)["poll_attempts"] == 1
+        assert store.get_by_issue(101)["outcome"] == "in_progress"
+
+        # signature verification still runs before the event-type branch
+        assert post(pull_request_payload(101), "pull_request", sign=False).status_code == 401
+
+        assert post(pull_request_payload(101), "pull_request").json()["status"] == "accepted"
+        record = store.get_by_issue(101)
+        assert record["outcome"] == "succeeded"
+        assert record["pr_url"].endswith("/pull/900")
+
+        # a pull request for an issue we never saw is acknowledged and dropped
+        assert post(pull_request_payload(777), "pull_request").json()["status"] == "ignored"
+        assert post(issue_payload(DEMO_FINDINGS[0]), "push").json()["status"] == "ignored"
+        # the four correctly signed deliveries; the unsigned one never got that far
+        assert store.counters()["webhooks_received"] == 4
 
 
 def test_event_loop_policy_sanity():
