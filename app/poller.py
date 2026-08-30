@@ -2,7 +2,8 @@
 
 Terminal classification is deliberately fine-grained:
 
-  succeeded         terminal success, structured output ``fixed == true``
+  succeeded         terminal success, structured output ``fixed == true``, or a pull
+                    request exists and ``terminal_on_pr`` is enabled
   declined          terminal success, structured output ``fixed == false``
   failed            API reports ``status == "error"``
   blocked_on_budget ``suspended`` for a cost/quota reason, or ACU cap hit
@@ -41,7 +42,7 @@ def _pr_url(session: dict[str, Any], structured: dict[str, Any] | None) -> str:
         return str(structured["pr_url"])
     for pull in session.get("pull_requests") or []:
         if isinstance(pull, dict):
-            url = pull.get("url") or pull.get("html_url")
+            url = pull.get("pr_url") or pull.get("url") or pull.get("html_url")
             if url:
                 return str(url)
         elif isinstance(pull, str):
@@ -49,7 +50,12 @@ def _pr_url(session: dict[str, Any], structured: dict[str, Any] | None) -> str:
     return ""
 
 
-def classify(session: dict[str, Any], *, max_acu_limit: int | None = None) -> tuple[str | None, str]:
+def classify(
+    session: dict[str, Any],
+    *,
+    max_acu_limit: int | None = None,
+    terminal_on_pr: bool = False,
+) -> tuple[str | None, str]:
     """Map a session payload to ``(outcome, note)``; ``outcome`` is None if still running."""
     status = session.get("status")
     detail = session.get("status_detail")
@@ -70,6 +76,9 @@ def classify(session: dict[str, Any], *, max_acu_limit: int | None = None) -> tu
     ):
         return "blocked_on_budget", f"hit max_acu_limit ({max_acu_limit} ACU)"
 
+    if terminal_on_pr and _pr_url(session, structured):
+        return "succeeded", "pull request opened"
+
     if status == TERMINAL_SUCCESS_STATUS or detail == "finished":
         if structured is None:
             # Terminal without structured output: treat as declined-with-no-reason rather
@@ -89,6 +98,7 @@ class Poller:
         interval_seconds: int,
         max_wait_seconds: int,
         max_acu_limit: int,
+        terminal_on_pr: bool = False,
         on_terminal: Any = None,
     ) -> None:
         self.store = store
@@ -96,6 +106,7 @@ class Poller:
         self.interval_seconds = interval_seconds
         self.max_wait_seconds = max_wait_seconds
         self.max_acu_limit = max_acu_limit
+        self.terminal_on_pr = terminal_on_pr
         self.on_terminal = on_terminal
         self._task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
@@ -155,7 +166,11 @@ class Poller:
             return
 
         structured = session.get("structured_output") or None
-        outcome, note = classify(session, max_acu_limit=self.max_acu_limit)
+        outcome, note = classify(
+            session,
+            max_acu_limit=self.max_acu_limit,
+            terminal_on_pr=self.terminal_on_pr,
+        )
         status = session.get("status") or ""
         detail = session.get("status_detail")
 

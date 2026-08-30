@@ -42,6 +42,12 @@ class Settings:
     #: When set, /status and /report require ``Authorization: Bearer <token>``.
     #: The tunnelled service is world-reachable, so set it for anything but a local demo.
     status_token: str = field(default_factory=lambda: os.getenv("STATUS_TOKEN", ""))
+    #: Treat "Devin opened a pull request" as the terminal success signal instead of
+    #: waiting for the session itself to exit: the PR is the deliverable, and ACUs keep
+    #: accruing while the session idles in ``waiting_for_user``.
+    terminal_on_pr: bool = field(
+        default_factory=lambda: os.getenv("TERMINAL_ON_PR", "true").lower() in {"1", "true", "yes"}
+    )
     dry_run: bool = field(
         default_factory=lambda: os.getenv("DRY_RUN", "false").lower() in {"1", "true", "yes"}
     )
