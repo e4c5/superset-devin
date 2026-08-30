@@ -255,6 +255,21 @@ async def test_scenario_b_same_finding_two_issues(tmp_path):
     assert sum(1 for method, _ in fake_devin.requests if method == "POST") == 1
 
 
+@pytest.mark.asyncio
+async def test_dry_run_records_the_claim_without_calling_devin(tmp_path):
+    _, store, orch, _, fake_devin, _ = build_stack(tmp_path, dry_run=True)
+
+    result = await orch.handle_issue_event(issue_payload(DEMO_FINDINGS[0]))
+
+    assert result["status"] == "dry_run"
+    assert fake_devin.requests == []
+    record = store.all_records()[0]
+    assert record["status"] == "dry_run" and record["devin_id"] is None
+    # no devin_id, still in_progress: invisible to the poller and to the metrics
+    assert store.non_terminal() == []
+    assert build_metrics(store)["issues_addressed"] == 0
+
+
 async def _settle_succeeded(store, orch, fake_github, pr_number=10):
     """Run the first issue through to a succeeded record with a PR."""
     await orch.handle_issue_event(issue_payload(DEMO_FINDINGS[0]))

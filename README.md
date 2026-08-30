@@ -73,7 +73,7 @@ make run                       # uvicorn --env-file .env, port 8080
 curl -s localhost:8080/healthz
 ```
 
-### 3. Expose it with localtunnel
+### 3. Expose it with a tunnel
 
 ```bash
 npm install -g localtunnel
@@ -81,7 +81,25 @@ lt --port 8080 --subdomain superset-devin
 # → https://superset-devin.loca.lt
 ```
 
+> **loca.lt can silently break the demo.** Its anti-abuse layer sometimes answers
+> a first request from a new client IP with an HTML interstitial instead of
+> proxying it. GitHub does not click through it: the delivery is recorded as a
+> non-2xx response and the session is never created, with nothing wrong in our
+> logs because the request never reached us. Check *Recent Deliveries* on the
+> webhook if an issue produces no `webhook.received` line. For anything you care
+> about, prefer a tunnel with no interstitial:
+>
+> ```bash
+> cloudflared tunnel --url http://localhost:8080     # free, no account needed
+> ngrok http 8080                                    # paid tier for a stable domain
+> ```
+
 ### 4. Point GitHub at it
+
+You need **admin on `e4c5/superset`** for this step (a PAT needs `admin:repo_hook`
+as well as `repo`) — webhooks can only be created by a repo admin. Without it,
+ask an admin to add the webhook; everything else here works with plain push
+access.
 
 On `e4c5/superset` → Settings → Webhooks → Add webhook:
 
@@ -111,6 +129,16 @@ curl -s localhost:8080/status | jq    # live rollup
 curl -s localhost:8080/report         # the same as markdown
 docker compose exec orchestrator cat /srv/data/report.md   # rewritten on every terminal outcome
 ```
+
+### Dry run: real webhooks, no ACUs
+
+`DRY_RUN=true` runs the whole live path — signature check, label gate, body
+parse, dedup claim, prompt build — and stops just before the Devin API call,
+logging `session.dry_run` with the prompt it *would* have sent. Only
+`GITHUB_WEBHOOK_SECRET` is needed; the Devin and GitHub tokens can be left
+empty. Dry-run records carry no session id, so they never reach the poller and
+never land in the metrics. Use it to prove your tunnel and webhook config are
+right before spending a single ACU.
 
 ## Simulate the workflow (no tokens, no network)
 

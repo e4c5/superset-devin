@@ -191,6 +191,26 @@ class Orchestrator:
         prompt = build_prompt(finding, issue_number, self.settings.target_repo)
         title = f"Fix SonarQube {finding.rule or 'finding'} in issue #{issue_number}"
 
+        if self.settings.dry_run:
+            # Exercise signature check → gate → parse → dedup against real GitHub
+            # traffic without spending ACUs. The record keeps no devin_id, so the
+            # poller ignores it and it stays out of the metrics denominator.
+            self.store.update(
+                finding.finding_key,
+                tags=tags,
+                status="dry_run",
+                status_detail="DRY_RUN: no Devin session created",
+            )
+            log_event(
+                "session.dry_run",
+                issue=issue_number,
+                devin_id=devin_id,
+                title=title,
+                tags=tags,
+                prompt_chars=len(prompt),
+            )
+            return {"status": "dry_run", "devin_id": devin_id}
+
         try:
             result = await self.devin.create_session(
                 devin_id=devin_id,
