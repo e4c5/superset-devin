@@ -1,0 +1,24 @@
+services:
+  orchestrator:
+    build: .
+    image: superset-devin-orchestrator:latest
+    container_name: superset-devin-orchestrator
+    env_file:
+      - .env
+    environment:
+      PORT: "8080"
+      DATABASE_PATH: /srv/data/state.db
+      REPORT_PATH: /srv/data/report.md
+    ports:
+      # This is the port localtunnel points at: `lt --port 8080 --subdomain <name>`
+      - "8080:8080"
+    volumes:
+      # Persist the dedup/state DB and the run report across restarts, so an
+      # orchestrator restart mid-demo rehydrates its in-flight sessions. A named
+      # volume (not a bind mount) inherits the image's ownership, so the non-root
+      # container user can write to it on a fresh checkout.
+      - orchestrator-data:/srv/data
+    restart: unless-stopped
+
+volumes:
+  orchestrator-data:
