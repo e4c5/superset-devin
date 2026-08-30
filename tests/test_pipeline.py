@@ -255,6 +255,107 @@ async def test_scenario_b_same_finding_two_issues(tmp_path):
     assert sum(1 for method, _ in fake_devin.requests if method == "POST") == 1
 
 
+async def _settle_succeeded(store, orch, fake_github, pr_number=10):
+    """Run the first issue through to a succeeded record with a PR."""
+    await orch.handle_issue_event(issue_payload(DEMO_FINDINGS[0]))
+    key = store.all_records()[0]["finding_key"]
+    store.update(
+        key,
+        status="exit",
+        status_detail="finished",
+        outcome="succeeded",
+        pr_url=f"https://github.com/e4c5/superset/pull/{pr_number}",
+    )
+    fake_github.comments.clear()
+    return key
+
+
+@pytest.mark.asyncio
+async def test_refile_reclaims_finding_when_pull_request_closed_unmerged(tmp_path):
+    _, store, orch, _, fake_devin, fake_github = build_stack(tmp_path)
+    key = await _settle_succeeded(store, orch, fake_github)
+    fake_github.pull_states[10] = ("closed", False)
+
+    refiled = await orch.handle_issue_event(issue_payload(DEMO_FINDINGS[0], number=106))
+
+    assert refiled["status"] == "session_created"
+    record = store.get(key)
+    assert record["issue_number"] == 106
+    assert record["outcome"] == "in_progress"
+    # the abandoned attempt's results must not leak into the new one
+    assert not record["pr_url"] and record["acus_consumed"] == 0
+    assert record["devin_id"] == "devin-s6440-issue-106"
+    assert store.counters()["dedup_skips"] == 0
+    assert store.counters()["findings_reclaimed"] == 1
+    assert sum(1 for method, _ in fake_devin.requests if method == "POST") == 2
+
+
+@pytest.mark.asyncio
+async def test_refile_reclaims_finding_when_previous_issue_closed(tmp_path):
+    _, store, orch, _, _, fake_github = build_stack(tmp_path)
+    await _settle_succeeded(store, orch, fake_github)
+    fake_github.pull_states[10] = ("open", False)
+    fake_github.issue_states[101] = "closed"
+
+    refiled = await orch.handle_issue_event(issue_payload(DEMO_FINDINGS[0], number=106))
+
+    assert refiled["status"] == "session_created"
+
+
+@pytest.mark.asyncio
+async def test_refile_still_deduped_when_fix_is_live(tmp_path):
+    _, store, orch, _, _, fake_github = build_stack(tmp_path)
+    await _settle_succeeded(store, orch, fake_github)
+    fake_github.pull_states[10] = ("closed", True)  # merged: the fix landed
+    fake_github.issue_states[101] = "closed"
+
+    merged = await orch.handle_issue_event(issue_payload(DEMO_FINDINGS[0], number=106))
+    assert merged["status"] == "skipped_duplicate"
+
+    # ...and while the PR is simply still open, with the issue open too
+    fake_github.pull_states[10] = ("open", False)
+    fake_github.issue_states[101] = "open"
+    open_pr = await orch.handle_issue_event(issue_payload(DEMO_FINDINGS[0], number=107))
+    assert open_pr["status"] == "skipped_duplicate"
+    assert store.counters()["dedup_skips"] == 2
+
+
+@pytest.mark.asyncio
+async def test_refile_is_deduped_when_github_cannot_be_reached(tmp_path):
+    settings, store, _, _, fake_devin, fake_github = build_stack(tmp_path, github_token="")
+    orch = Orchestrator(
+        settings=settings,
+        store=store,
+        devin=DevinClient(
+            base_url=settings.devin_api_base, org_id=ORG, token="cog_test",
+            transport=fake_devin.transport(), backoff_base=0.001,
+        ),
+        github=GitHubClient(token="", repo=settings.target_repo, transport=fake_github.transport()),
+    )
+    await _settle_succeeded(store, orch, fake_github)
+    fake_github.pull_states[10] = ("closed", False)
+
+    # Unverifiable prior state must not be read as "abandoned".
+    refiled = await orch.handle_issue_event(issue_payload(DEMO_FINDINGS[0], number=106))
+    assert refiled["status"] == "skipped_duplicate"
+
+
+def test_reclaim_loses_race_when_record_changed(tmp_path):
+    store = Store(str(tmp_path / "state.db"))
+    claim = store.claim_finding("sonar:k", 1)
+    store.update("sonar:k", outcome="succeeded")
+
+    stale = store.reclaim_finding(
+        "sonar:k", 2, expected_updated_at=float(claim.record["updated_at"])
+    )
+    assert not stale.acquired and stale.record["issue_number"] == 1
+
+    fresh = store.reclaim_finding(
+        "sonar:k", 2, expected_updated_at=float(store.get("sonar:k")["updated_at"])
+    )
+    assert fresh.acquired and fresh.record["issue_number"] == 2
+
+
 @pytest.mark.asyncio
 async def test_scenario_a_redelivery_is_skipped(tmp_path):
     _, store, orch, _, _, fake_github = build_stack(tmp_path)

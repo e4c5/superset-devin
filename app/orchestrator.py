@@ -12,7 +12,7 @@ from .github_client import GitHubClient
 from .logging_setup import log_event
 from .metrics import write_report
 from .poller import Poller
-from .store import Store, tags_for
+from .store import TERMINAL_OUTCOMES, Claim, Store, tags_for
 
 TRIGGER_ACTIONS = {"opened", "labeled"}
 
@@ -86,6 +86,8 @@ class Orchestrator:
             lines=finding.lines,
             message=finding.message,
         )
+        if not claim.acquired and claim.scenario == "duplicate_finding":
+            claim = await self._maybe_reclaim(claim, issue_number, finding)
         if not claim.acquired:
             return await self._skip_duplicate(issue_number, claim.record, finding.finding_key)
 
@@ -96,6 +98,58 @@ class Orchestrator:
             scenario=claim.scenario,
         )
         return await self._create_session(issue_number, finding)
+
+    async def _maybe_reclaim(self, claim: Claim, issue_number: int, finding: Any) -> Claim:
+        """Re-open a finding whose earlier attempt never landed.
+
+        A prior `succeeded` record only blocks a refile while the fix is still
+        live: an issue closed without a merged PR, or a PR closed unmerged, means
+        the defect is still in the tree and the finding deserves another session.
+        """
+        previous = claim.record
+        reason = await self._abandoned_reason(previous)
+        if reason is None:
+            return claim
+        reclaimed = self.store.reclaim_finding(
+            finding.finding_key,
+            issue_number,
+            expected_updated_at=float(previous["updated_at"]),
+            rule=finding.rule,
+            file=finding.file,
+            lines=finding.lines,
+            message=finding.message,
+        )
+        log_event(
+            "dedup.reclaim" if reclaimed.acquired else "dedup.reclaim_lost",
+            issue=issue_number,
+            finding_key=finding.finding_key,
+            previous_issue=previous.get("issue_number"),
+            previous_outcome=previous.get("outcome"),
+            previous_pr=previous.get("pr_url"),
+            reason=reason,
+        )
+        return reclaimed
+
+    async def _abandoned_reason(self, previous: dict[str, Any]) -> str | None:
+        """Why the previous attempt should not block a refile, or None if it should."""
+        if previous.get("outcome") not in TERMINAL_OUTCOMES:
+            return None  # a session is still working on it
+        pr_url = previous.get("pr_url") or ""
+        if pr_url:
+            state = await self.github.pull_request_state(pr_url)
+            if state is None:
+                return None  # cannot verify — stay conservative and dedup
+            pr_state, merged = state
+            if merged:
+                return None
+            if pr_state == "closed":
+                return "previous pull request closed without merging"
+        previous_issue = previous.get("issue_number")
+        if isinstance(previous_issue, int) and await self.github.issue_state(previous_issue) == "closed":
+            return "previous issue closed without a merged fix"
+        if not pr_url and previous.get("outcome") == "succeeded":
+            return "previous session succeeded without opening a pull request"
+        return None
 
     async def _skip_duplicate(
         self, issue_number: int, existing: dict[str, Any], finding_key: str

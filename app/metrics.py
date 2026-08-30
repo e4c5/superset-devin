@@ -62,6 +62,7 @@ def build_metrics(store: Store) -> dict[str, Any]:
         "webhooks_received": counters.get("webhooks_received", 0),
         "webhooks_ignored": counters.get("webhooks_ignored", 0),
         "sessions_reused_409": counters.get("sessions_reused_409", 0),
+        "findings_reclaimed": counters.get("findings_reclaimed", 0),
         "records": [
             {
                 "issue_number": r["issue_number"],
@@ -103,6 +104,7 @@ def render_report(metrics: dict[str, Any]) -> str:
         f"| Duplicate webhooks/findings ignored | {metrics['dedup_skips']} |",
         f"| ...of which GitHub webhook redeliveries | {metrics['redeliveries_ignored']} |",
         f"| Sessions reused via 409 (idempotent create) | {metrics['sessions_reused_409']} |",
+        f"| Findings re-opened after an abandoned fix | {metrics['findings_reclaimed']} |",
         "",
         "## Outcome breakdown",
         "",

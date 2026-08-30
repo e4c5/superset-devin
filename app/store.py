@@ -196,6 +196,58 @@ class Store:
             conn.execute("ROLLBACK")
             raise
 
+    def reclaim_finding(
+        self,
+        finding_key: str,
+        issue_number: int,
+        *,
+        expected_updated_at: float,
+        rule: str = "",
+        file: str = "",
+        lines: str = "",
+        message: str = "",
+    ) -> Claim:
+        """Take over a finding whose previous attempt did not actually land.
+
+        Used when the earlier issue was closed or its pull request was closed
+        unmerged. ``expected_updated_at`` guards the takeover: if anything touched
+        the record since it was read, the caller loses and the skip stands.
+        """
+        now = time.time()
+        conn = self._connect()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            changed = conn.execute(
+                "UPDATE issues SET issue_number = ?, rule = ?, file = ?, lines = ?, message = ?,"
+                " status = 'pending', status_detail = NULL, outcome = ?, session_id = NULL,"
+                " devin_id = NULL, tags = '[]', pr_url = NULL, acus_consumed = 0,"
+                " structured_output = NULL, terminal_at = NULL, created_at = ?, updated_at = ?"
+                " WHERE finding_key = ? AND updated_at = ?",
+                (issue_number, rule, file, lines, message, NON_TERMINAL_OUTCOME, now, now,
+                 finding_key, expected_updated_at),
+            ).rowcount
+            if changed:
+                # The skip that led here was provisional; unwind it so the metrics
+                # count only dedups that actually suppressed work.
+                conn.execute(
+                    "DELETE FROM dedup_events WHERE id = (SELECT MAX(id) FROM dedup_events"
+                    " WHERE finding_key = ? AND issue_number = ? AND scenario = 'duplicate_finding')",
+                    (finding_key, issue_number),
+                )
+                self._bump(conn, "dedup_skips", -1)
+                self._bump(conn, "findings_reclaimed")
+            row = conn.execute(
+                "SELECT * FROM issues WHERE finding_key = ?", (finding_key,)
+            ).fetchone()
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        record = _row_to_dict(row) if row else {}
+        if not changed:
+            return Claim(acquired=False, record=record, scenario="duplicate_finding")
+        return Claim(acquired=True, record=record, scenario="reclaimed")
+
     # -- counters --------------------------------------------------------
     @staticmethod
     def _bump(conn: sqlite3.Connection, name: str, amount: int = 1) -> None:

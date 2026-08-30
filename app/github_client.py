@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import httpx
 
@@ -34,6 +35,38 @@ class GitHubClient:
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+    async def issue_state(self, issue_number: int) -> str | None:
+        """``"open"``/``"closed"``, or None when GitHub could not be asked."""
+        payload = await self._get(f"/repos/{self.repo}/issues/{issue_number}")
+        state = payload.get("state") if payload else None
+        return str(state) if state else None
+
+    async def pull_request_state(self, pr_url: str) -> tuple[str, bool] | None:
+        """``(state, merged)`` for an ``.../pull/<n>`` URL, or None if unreadable."""
+        number = pr_url.rstrip("/").rsplit("/", 1)[-1]
+        if not number.isdigit():
+            return None
+        payload = await self._get(f"/repos/{self.repo}/pulls/{number}")
+        if not payload or not payload.get("state"):
+            return None
+        return str(payload["state"]), bool(payload.get("merged") or payload.get("merged_at"))
+
+    async def _get(self, path: str) -> dict[str, Any] | None:
+        if not self.enabled:
+            return None
+        try:
+            response = await self._client.get(path)
+        except httpx.HTTPError as exc:
+            log_event("github.get_failed", level=logging.WARNING, path=path, error=str(exc))
+            return None
+        if response.status_code >= 400:
+            log_event(
+                "github.get_failed", level=logging.WARNING, path=path, status=response.status_code
+            )
+            return None
+        payload = response.json()
+        return payload if isinstance(payload, dict) else None
 
     async def comment(self, issue_number: int, body: str) -> bool:
         """Best-effort issue comment. Never raises — visibility must not break the pipeline."""
