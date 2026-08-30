@@ -426,6 +426,52 @@ def test_classify_acu_cap_is_budget_not_failure():
     assert classify(session, max_acu_limit=10)[0] == "blocked_on_budget"
 
 
+def test_classify_pull_request_is_terminal_success_when_enabled():
+    session = {
+        "status": "running",
+        "status_detail": "waiting_for_user",
+        "acus_consumed": 4.5,
+        "pull_requests": [{"pr_url": "https://github.com/e4c5/superset/pull/10"}],
+    }
+    assert classify(session, max_acu_limit=10)[0] is None
+    outcome, note = classify(session, max_acu_limit=10, terminal_on_pr=True)
+    assert (outcome, note) == ("succeeded", "pull request opened")
+
+
+@pytest.mark.asyncio
+async def test_poller_finalizes_on_pull_request_and_snapshots_acus(tmp_path):
+    settings, store, orch, _poller, fake_devin, _gh = build_stack(tmp_path)
+    # Devin opens the PR on the first poll but keeps running (waiting_for_user).
+    fake_devin.default_scenario = Scenario(
+        ticks_to_terminal=10,
+        acus=20.0,
+        pr_on_tick=1,
+        structured_output={"fixed": True, "rule": "typescript:S6440",
+                           "pr_url": "https://github.com/e4c5/superset/pull/10",
+                           "summary": "", "reason": ""},
+    )
+    poller = Poller(
+        store=store,
+        client=DevinClient(base_url=settings.devin_api_base, org_id=ORG, token="cog_test",
+                           transport=fake_devin.transport(), backoff_base=0.001),
+        interval_seconds=1,
+        max_wait_seconds=settings.session_max_wait_seconds,
+        max_acu_limit=settings.max_acu_limit,
+        terminal_on_pr=True,
+    )
+    await orch.handle_issue_event(issue_payload(DEMO_FINDINGS[0]))
+
+    await poller.tick()
+
+    record = store.all_records()[0]
+    assert record["outcome"] == "succeeded"
+    assert record["status_detail"] == "pull request opened"
+    assert record["pr_url"] == "https://github.com/e4c5/superset/pull/10"
+    # ACUs snapshotted at the moment the PR appeared, not at session exit.
+    assert record["acus_consumed"] == 2.0
+    assert record["terminal_at"] is not None
+
+
 @pytest.mark.asyncio
 async def test_poller_transient_failure_does_not_mark_failed(tmp_path):
     scenarios = {

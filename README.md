@@ -177,6 +177,13 @@ session non-terminal and it is retried on the next tick; the per-session
 `SESSION_MAX_WAIT_SECONDS` deadline is what eventually resolves it as
 `timed_out`.
 
+**The pull request is the finish line.** With `TERMINAL_ON_PR=true` (the default)
+a session is settled as `succeeded` as soon as it has a PR, and the ACUs are
+snapshotted at that tick — a Devin session often keeps running in
+`waiting_for_user` long after the deliverable exists, and metering that idle
+time would distort cost-per-fix. Set `TERMINAL_ON_PR=false` to wait for the
+session's own `exit`/`finished` instead.
+
 **A budget stop is not a defect.** `status == "suspended"` with an
 out-of-credits/usage-limit detail, or hitting `MAX_ACU_LIMIT`, is its own
 `blocked_on_budget` bucket, so cost caps never pollute the failure rate.

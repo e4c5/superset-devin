@@ -65,6 +65,7 @@ def build_app(
         interval_seconds=settings.poll_interval_seconds,
         max_wait_seconds=settings.session_max_wait_seconds,
         max_acu_limit=settings.max_acu_limit,
+        terminal_on_pr=settings.terminal_on_pr,
         on_terminal=lambda _record: write_report(state_store, settings.report_path),
     )
     orchestrator = Orchestrator(

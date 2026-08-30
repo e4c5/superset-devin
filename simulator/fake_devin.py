@@ -29,6 +29,9 @@ class Scenario:
     fail_get_on_tick: int | None = None
     #: emit one 429 (with Retry-After) before honouring the create
     rate_limit_creates: int = 0
+    #: attach a pull request from the Nth GET (1-based) while the session is still
+    #: running, mirroring Devin opening the PR and then idling in ``waiting_for_user``
+    pr_on_tick: int | None = None
 
 
 DEFAULT_SCENARIO = Scenario(
@@ -133,6 +136,10 @@ class FakeDevinAPI:
             session["status"] = "running"
             session["status_detail"] = "working"
             session["acus_consumed"] = round(scenario.acus * tick / scenario.ticks_to_terminal, 2)
+            if scenario.pr_on_tick is not None and tick >= scenario.pr_on_tick:
+                pr_url = (scenario.structured_output or {}).get("pr_url")
+                session["status_detail"] = "waiting_for_user"
+                session["pull_requests"] = [{"pr_url": pr_url}] if pr_url else []
         else:
             session["status"] = scenario.terminal_status
             session["status_detail"] = scenario.terminal_status_detail
