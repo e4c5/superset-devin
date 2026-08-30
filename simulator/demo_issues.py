@@ -115,7 +115,7 @@ def issue_payload(
     label: str = "devin-fix",
     repo: str = "e4c5/superset",
 ) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "action": action,
         "repository": {"full_name": repo},
         "issue": {
@@ -126,3 +126,6 @@ def issue_payload(
             "html_url": f"https://github.com/{repo}/issues/{number or finding['number']}",
         },
     }
+    if action == "labeled":
+        payload["label"] = {"name": label}
+    return payload

@@ -22,7 +22,7 @@ from app.github_client import GitHubClient
 from app.metrics import build_metrics
 from app.orchestrator import Orchestrator
 from app.poller import Poller, classify
-from app.store import Store
+from app.store import STALE_CLAIM_SECONDS, Store
 from app.webhook import build_app, verify_signature
 from simulator.demo_issues import DEMO_FINDINGS, issue_payload
 from simulator.fake_devin import FakeDevinAPI, FakeGitHubAPI, Scenario
@@ -131,6 +131,48 @@ def test_webhook_endpoint_gating(tmp_path):
         assert store.get_by_issue(101)["devin_id"] == "devin-s6440-issue-101"
         assert client.get("/status").json()["issues_addressed"] == 1
         assert "SonarQube auto-remediation" in client.get("/report").text
+
+
+def test_gate_rejects_foreign_repository_and_unrelated_labels(tmp_path):
+    _, _, orch, _, _, _ = build_stack(tmp_path)
+
+    spoofed = issue_payload(DEMO_FINDINGS[0], repo="attacker/evil")
+    handled, reason = orch.should_handle(spoofed)
+    assert not handled and "attacker/evil" in reason
+
+    other_label = issue_payload(DEMO_FINDINGS[0], action="labeled")
+    other_label["label"] = {"name": "needs-triage"}
+    handled, reason = orch.should_handle(other_label)
+    assert not handled and "not the trigger label" in reason
+
+    assert orch.should_handle(issue_payload(DEMO_FINDINGS[0], action="labeled"))[0]
+
+
+def test_abandoned_claim_is_resumed_and_reclaim_clears_prior_attempt(tmp_path):
+    store = Store(str(tmp_path / "s.db"))
+    assert store.claim_finding("sonar:abc", 1).scenario == "new"
+    # A claim with no session recorded is a redelivery while the create is in flight...
+    assert store.claim_finding("sonar:abc", 1).scenario == "redelivery"
+    # ...but an abandoned one (orchestrator died mid-create) is retried.
+    store._connect().execute(
+        "UPDATE issues SET updated_at = ? WHERE finding_key = 'sonar:abc'",
+        (time.time() - STALE_CLAIM_SECONDS - 1,),
+    )
+    assert store.claim_finding("sonar:abc", 1).scenario == "resumed"
+
+    store.update(
+        "sonar:abc",
+        devin_id="devin-1",
+        pr_url="https://example.com/pr/1",
+        acus_consumed=4.0,
+        outcome="failed",
+        terminal_at=time.time(),
+    )
+    reclaimed = store.claim_finding("sonar:abc", 2, rule="r", file="f").record
+    assert reclaimed["pr_url"] is None
+    assert reclaimed["acus_consumed"] == 0
+    assert reclaimed["terminal_at"] is None
+    assert reclaimed["created_at"] == reclaimed["updated_at"]
 
 
 # --------------------------------------------------------------------------
@@ -317,6 +359,11 @@ async def test_orchestrator_marks_errored_and_comments_on_auth_failure(tmp_path)
     assert result["status"] == "errored"
     assert store.get_by_issue(101)["outcome"] == "errored"
     assert "could not be created" in fake_github.comments[0][1]
+    # A creation failure has no devin_id but must stay visible in the rollup.
+    metrics = build_metrics(store)
+    assert metrics["issues_addressed"] == 1
+    assert metrics["outcomes"]["errored"] == 1
+    assert metrics["success_rate_pct"] == 0.0
 
 
 # --------------------------------------------------------------------------

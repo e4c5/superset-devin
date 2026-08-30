@@ -38,10 +38,20 @@ class Orchestrator:
         return f"{self.settings.devin_id_prefix}{issue_number}"
 
     def should_handle(self, payload: dict[str, Any]) -> tuple[bool, str]:
+        repo = (payload.get("repository") or {}).get("full_name")
+        if repo != self.settings.target_repo:
+            # A secret shared with another repo's webhook must not be able to aim
+            # a session at the target repo.
+            return False, f"repository={repo!r} is not {self.settings.target_repo!r}"
         action = payload.get("action")
         if action not in TRIGGER_ACTIONS:
             return False, f"action={action} not in {sorted(TRIGGER_ACTIONS)}"
         issue = payload.get("issue") or {}
+        if action == "labeled":
+            added = payload.get("label") or {}
+            added_name = added.get("name") if isinstance(added, dict) else added
+            if added_name != self.settings.trigger_label:
+                return False, f"labeled with {added_name!r}, not the trigger label"
         labels = {
             (label.get("name") if isinstance(label, dict) else label)
             for label in issue.get("labels") or []

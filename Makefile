@@ -5,7 +5,7 @@ install:
 	.venv/bin/pip install -r requirements-dev.txt
 
 run:
-	.venv/bin/uvicorn app.webhook:app --host 0.0.0.0 --port $${PORT:-8080} --reload
+	.venv/bin/uvicorn app.webhook:app --host 0.0.0.0 --port $${PORT:-8080} --reload --env-file .env
 
 simulate:
 	.venv/bin/python -m scripts.simulate

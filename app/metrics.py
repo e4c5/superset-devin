@@ -6,7 +6,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
-from .store import Store
+from .store import NON_TERMINAL_OUTCOME, Store
 
 OUTCOMES = ["succeeded", "declined", "failed", "blocked_on_budget", "timed_out", "errored"]
 
@@ -19,7 +19,14 @@ def _elapsed(record: dict[str, Any]) -> float | None:
 
 
 def build_metrics(store: Store) -> dict[str, Any]:
-    records = [r for r in store.all_records() if r.get("devin_id")]
+    # A record without a session id is either an in-flight claim (not addressed yet)
+    # or a creation failure — the latter must stay in the errored count and in the
+    # success-rate denominator.
+    records = [
+        r
+        for r in store.all_records()
+        if r.get("devin_id") or r.get("outcome") != NON_TERMINAL_OUTCOME
+    ]
     counters = store.counters()
 
     breakdown = {name: 0 for name in OUTCOMES}

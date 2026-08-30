@@ -20,6 +20,9 @@ NON_TERMINAL_OUTCOME = "in_progress"
 TERMINAL_OUTCOMES = {"succeeded", "declined", "failed", "blocked_on_budget", "timed_out", "errored"}
 #: A finding whose previous attempt ended in one of these may be retried by a later issue.
 RECLAIMABLE_OUTCOMES = {"failed", "timed_out", "errored"}
+#: A claim with no session recorded after this long is assumed abandoned (a crash
+#: between claiming and creating) rather than a create still in flight.
+STALE_CLAIM_SECONDS = 120.0
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS issues (
@@ -65,7 +68,7 @@ class Claim:
 
     acquired: bool
     record: dict[str, Any]
-    scenario: str  # "new" | "duplicate_finding" | "reclaimed"
+    scenario: str  # "new" | "resumed" | "redelivery" | "duplicate_finding" | "reclaimed"
 
 
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -123,6 +126,24 @@ class Store:
             ).fetchone()
             if existing is not None:
                 record = _row_to_dict(existing)
+                stale_claim = (
+                    not record["devin_id"]
+                    and now - float(record["updated_at"]) > STALE_CLAIM_SECONDS
+                )
+                if record["issue_number"] == issue_number and stale_claim:
+                    # The claim exists but no session was ever recorded against it —
+                    # the orchestrator died between claiming and creating. Retry: the
+                    # deterministic devin_id reconciles via 409 if the POST did land.
+                    conn.execute(
+                        "UPDATE issues SET status = 'pending', status_detail = NULL,"
+                        " outcome = ?, updated_at = ? WHERE finding_key = ?",
+                        (NON_TERMINAL_OUTCOME, now, finding_key),
+                    )
+                    row = conn.execute(
+                        "SELECT * FROM issues WHERE finding_key = ?", (finding_key,)
+                    ).fetchone()
+                    conn.execute("COMMIT")
+                    return Claim(acquired=True, record=_row_to_dict(row), scenario="resumed")
                 if record["issue_number"] == issue_number:
                     # Scenario A: GitHub redelivered the same issue's webhook.
                     conn.execute(
@@ -145,11 +166,15 @@ class Store:
                     self._bump(conn, "dedup_skips")
                     conn.execute("COMMIT")
                     return Claim(acquired=False, record=record, scenario="duplicate_finding")
+                # A reclaim is a fresh attempt: clear the previous attempt's results so
+                # they cannot contaminate the new one, and restart its elapsed clock.
                 conn.execute(
-                    "UPDATE issues SET issue_number = ?, status = 'pending', status_detail = NULL,"
-                    " outcome = ?, session_id = NULL, devin_id = NULL, terminal_at = NULL,"
+                    "UPDATE issues SET issue_number = ?, rule = ?, file = ?, lines = ?, message = ?,"
+                    " status = 'pending', status_detail = NULL, outcome = ?, session_id = NULL,"
+                    " devin_id = NULL, tags = '[]', pr_url = NULL, acus_consumed = 0,"
+                    " structured_output = NULL, terminal_at = NULL, created_at = ?,"
                     " updated_at = ? WHERE finding_key = ?",
-                    (issue_number, NON_TERMINAL_OUTCOME, now, finding_key),
+                    (issue_number, rule, file, lines, message, NON_TERMINAL_OUTCOME, now, now, finding_key),
                 )
                 row = conn.execute(
                     "SELECT * FROM issues WHERE finding_key = ?", (finding_key,)

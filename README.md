@@ -62,14 +62,14 @@ it — it never silently stalls.
 ### 2. Start the service
 
 ```bash
-docker compose up --build      # serves on :8080, state persisted in ./data
+docker compose up --build      # serves on :8080, state in the orchestrator-data volume
 ```
 
 Or without Docker:
 
 ```bash
 make install
-make run                       # uvicorn app.webhook:app --port 8080
+make run                       # uvicorn --env-file .env, port 8080
 curl -s localhost:8080/healthz
 ```
 
@@ -109,7 +109,7 @@ ticket that demonstrates dedup).
 docker compose logs -f orchestrator   # structured JSON-lines lifecycle events
 curl -s localhost:8080/status | jq    # live rollup
 curl -s localhost:8080/report         # the same as markdown
-cat data/report.md                    # rewritten on every terminal outcome
+docker compose exec orchestrator cat /srv/data/report.md   # rewritten on every terminal outcome
 ```
 
 ## Simulate the workflow (no tokens, no network)
@@ -194,4 +194,6 @@ No secrets in the repo — `.env` is gitignored and `.env.example` holds
 placeholders only. Tokens are read from the environment, sent as bearer headers,
 and never logged. `X-Hub-Signature-256` is compared with `hmac.compare_digest`,
 and an unsigned or wrongly-signed request is rejected with 401 before the body
-is parsed.
+is parsed. A correctly-signed payload is still dropped unless
+`repository.full_name` is `TARGET_REPO`, so a secret shared with another repo's
+webhook cannot aim sessions at the fork.
