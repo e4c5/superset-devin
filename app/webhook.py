@@ -3,6 +3,10 @@
 The handler verifies ``X-Hub-Signature-256``, applies the ``devin-fix`` label
 gate, and returns 200 immediately — all Devin work happens in a background task
 so GitHub's own delivery retries never stack on top of our retry/backoff.
+
+Two event types are accepted: ``issues`` starts a session, and ``pull_request``
+is a low-latency completion signal for the happy path. The poller stays the
+source of truth and resolves everything the webhook does not.
 """
 
 from __future__ import annotations
@@ -64,6 +68,8 @@ def build_app(
         client=devin,
         interval_seconds=settings.poll_interval_seconds,
         max_wait_seconds=settings.session_max_wait_seconds,
+        backoff_base_seconds=settings.poll_backoff_base_seconds,
+        backoff_cap_seconds=settings.poll_backoff_cap_seconds,
         max_acu_limit=settings.max_acu_limit,
         terminal_on_pr=settings.terminal_on_pr,
         on_terminal=lambda _record: write_report(state_store, settings.report_path),
@@ -144,7 +150,18 @@ def build_app(
             github_event=x_github_event,
             action=payload.get("action"),
             issue=(payload.get("issue") or {}).get("number"),
+            pull_request=(payload.get("pull_request") or {}).get("number"),
         )
+
+        if x_github_event == "pull_request":
+            handle, reason = orchestrator.should_handle_pull_request(payload)
+            if not handle:
+                state_store.increment("webhooks_ignored")
+                log_event("webhook.ignored", reason=reason,
+                          pull_request=(payload.get("pull_request") or {}).get("number"))
+                return JSONResponse({"status": "ignored", "reason": reason})
+            background.add_task(_dispatch_pull_request, orchestrator, payload)
+            return JSONResponse({"status": "accepted"}, status_code=200)
 
         if x_github_event != "issues":
             state_store.increment("webhooks_ignored")
@@ -161,6 +178,19 @@ def build_app(
         return JSONResponse({"status": "accepted"}, status_code=200)
 
     return app
+
+
+async def _dispatch_pull_request(orchestrator: Orchestrator, payload: dict[str, Any]) -> None:
+    try:
+        await orchestrator.handle_pull_request_event(payload)
+    except Exception as exc:  # noqa: BLE001 - background task must never crash the server
+        log_event(
+            "webhook.dispatch_error",
+            pull_request=(payload.get("pull_request") or {}).get("number"),
+            error=str(exc),
+        )
+    finally:
+        orchestrator.write_report()
 
 
 async def _dispatch(orchestrator: Orchestrator, payload: dict[str, Any]) -> None:

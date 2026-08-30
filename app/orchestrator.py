@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from .config import Settings
@@ -15,6 +16,9 @@ from .poller import Poller
 from .store import TERMINAL_OUTCOMES, Claim, Store, tags_for
 
 TRIGGER_ACTIONS = {"opened", "labeled"}
+#: A pull request is only a completion signal when it appears (or reappears).
+PR_TRIGGER_ACTIONS = {"opened", "reopened", "ready_for_review"}
+_ISSUE_REFERENCE = re.compile(r"#(\d+)")
 
 
 class Orchestrator:
@@ -59,6 +63,81 @@ class Orchestrator:
         if self.settings.trigger_label not in labels:
             return False, f"missing label {self.settings.trigger_label!r}"
         return True, "ok"
+
+    # -- pull requests ---------------------------------------------------
+    def referenced_issue(self, payload: dict[str, Any]) -> int | None:
+        """The tracked issue a pull request refers to, if any.
+
+        Devin is prompted to reference ``issue #<n>`` in the pull request it opens
+        (see ``findings.PROMPT_TEMPLATE``), so the first ``#<n>`` in the title or
+        body that we actually have a record for identifies the session.
+        """
+        pull = payload.get("pull_request") or {}
+        text = f"{pull.get('title') or ''}\n{pull.get('body') or ''}"
+        for match in _ISSUE_REFERENCE.finditer(text):
+            issue_number = int(match.group(1))
+            if self.store.get_by_issue(issue_number) is not None:
+                return issue_number
+        return None
+
+    def should_handle_pull_request(self, payload: dict[str, Any]) -> tuple[bool, str]:
+        """Gate for ``pull_request`` events; deliberately separate from ``should_handle``.
+
+        The two payload shapes share nothing but ``repository``, and a pull request
+        carries no ``devin-fix`` label.
+        """
+        repo = (payload.get("repository") or {}).get("full_name")
+        if repo != self.settings.target_repo:
+            return False, f"repository={repo!r} is not {self.settings.target_repo!r}"
+        action = payload.get("action")
+        if action not in PR_TRIGGER_ACTIONS:
+            return False, f"action={action} not in {sorted(PR_TRIGGER_ACTIONS)}"
+        issue_number = self.referenced_issue(payload)
+        if issue_number is None:
+            return False, "pull request references no tracked issue"
+        record = self.store.get_by_issue(issue_number)
+        if record and record.get("outcome") in TERMINAL_OUTCOMES:
+            return False, f"issue #{issue_number} already {record['outcome']}"
+        return True, "ok"
+
+    async def handle_pull_request_event(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Resolve a session immediately from its pull request instead of waiting for a poll.
+
+        The check runs through the poller's own poll path, so ACUs, structured
+        output, ``pr_url`` and the terminal report are written exactly once and
+        identically to the polled path.
+        """
+        pull = payload.get("pull_request") or {}
+        issue_number = self.referenced_issue(payload)
+        if issue_number is None:
+            return {"status": "ignored", "reason": "no tracked issue referenced"}
+        record = self.store.get_by_issue(issue_number)
+        if record is None:
+            return {"status": "ignored", "reason": f"no record for issue #{issue_number}"}
+
+        log_event(
+            "webhook.pull_request_accepted",
+            issue=issue_number,
+            action=payload.get("action"),
+            pr_url=pull.get("html_url"),
+            devin_id=record.get("devin_id"),
+        )
+
+        if record.get("outcome") in TERMINAL_OUTCOMES:
+            return {"status": "already_terminal", "issue": issue_number,
+                    "outcome": record["outcome"]}
+        if self.poller is None:
+            return {"status": "ignored", "reason": "no poller configured"}
+
+        polled = await self.poller.poll_now(record)
+        if not polled:
+            return {"status": "already_terminal", "issue": issue_number}
+        settled = self.store.get(record["finding_key"]) or {}
+        return {
+            "status": "checked",
+            "issue": issue_number,
+            "outcome": settled.get("outcome"),
+        }
 
     # -- main entry point ------------------------------------------------
     async def handle_issue_event(self, payload: dict[str, Any]) -> dict[str, Any]:

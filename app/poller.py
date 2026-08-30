@@ -11,6 +11,12 @@ Terminal classification is deliberately fine-grained:
 
 A network error or 5xx while polling is *not* a failure: the record stays
 non-terminal and is retried on the next tick.
+
+The loop wakes on a short base tick but each session carries its own
+``next_poll_at``: a session that is still running has its gap doubled per
+attempt up to a cap, so long sessions cost a handful of API calls instead of one
+every ``POLL_INTERVAL_SECONDS``. The poller remains the source of truth — the
+``pull_request`` webhook only short-circuits the wait on the happy path.
 """
 
 from __future__ import annotations
@@ -22,7 +28,7 @@ from typing import Any
 
 from .devin_client import DevinAPIError, DevinAuthError, DevinClient, DevinTransientError
 from .logging_setup import log_event
-from .store import Store
+from .store import TERMINAL_OUTCOMES, Store
 
 TERMINAL_SUCCESS_STATUS = "exit"
 BUDGET_STATUS_DETAILS = {
@@ -98,12 +104,22 @@ class Poller:
         interval_seconds: int,
         max_wait_seconds: int,
         max_acu_limit: int,
+        backoff_base_seconds: float | None = None,
+        backoff_cap_seconds: float | None = None,
         terminal_on_pr: bool = False,
         on_terminal: Any = None,
     ) -> None:
         self.store = store
         self.client = client
         self.interval_seconds = interval_seconds
+        self.backoff_base_seconds = (
+            interval_seconds if backoff_base_seconds is None else backoff_base_seconds
+        )
+        self.backoff_cap_seconds = (
+            max(self.backoff_base_seconds, 300.0)
+            if backoff_cap_seconds is None
+            else backoff_cap_seconds
+        )
         self.max_wait_seconds = max_wait_seconds
         self.max_acu_limit = max_acu_limit
         self.terminal_on_pr = terminal_on_pr
@@ -140,9 +156,28 @@ class Poller:
                 continue
 
     async def tick(self) -> None:
-        """One sweep over every non-terminal, session-bearing record."""
+        """Poll every non-terminal record whose own backoff gap has elapsed."""
+        now = time.time()
         for record in self.store.non_terminal():
+            next_poll_at = record.get("next_poll_at")
+            if next_poll_at is not None and float(next_poll_at) > now:
+                continue
             await self._poll_one(record)
+
+    async def poll_now(self, record: dict[str, Any]) -> bool:
+        """Poll one record out of band (webhook-triggered), through the poll path.
+
+        Returns False when the record has nothing left to resolve, so a webhook
+        racing a poll tick cannot finalize the same record twice.
+        """
+        current = self.store.get(record["finding_key"]) or record
+        if current.get("outcome") in TERMINAL_OUTCOMES or not current.get("devin_id"):
+            return False
+        await self._poll_one(current)
+        return True
+
+    def _next_gap(self, poll_attempts: int) -> float:
+        return min(self.backoff_base_seconds * 2**poll_attempts, self.backoff_cap_seconds)
 
     async def _poll_one(self, record: dict[str, Any]) -> None:
         devin_id = record["devin_id"]
@@ -185,14 +220,20 @@ class Poller:
                 acus=session.get("acus_consumed"),
             )
 
-        self.store.update(
-            finding_key,
+        fields: dict[str, Any] = dict(
             status=status,
             status_detail=detail,
             acus_consumed=session.get("acus_consumed") or 0,
             pr_url=_pr_url(session, structured) or record.get("pr_url") or "",
             structured_output=structured,
         )
+        if outcome is None:
+            # Still running: widen this session's own gap before the next poll.
+            attempts = int(record.get("poll_attempts") or 0)
+            gap = self._next_gap(attempts)
+            fields["poll_attempts"] = attempts + 1
+            fields["next_poll_at"] = time.time() + gap
+        self.store.update(finding_key, **fields)
 
         if outcome is None:
             self._check_timeout(record)
@@ -212,6 +253,16 @@ class Poller:
     def _finalize(
         self, record: dict[str, Any], outcome: str, note: str, session: dict[str, Any]
     ) -> None:
+        current = self.store.get(record["finding_key"])
+        if current is not None and current.get("outcome") in TERMINAL_OUTCOMES:
+            # Already settled by a concurrent webhook or tick: one terminal report only.
+            log_event(
+                "session.finalize_skipped",
+                devin_id=record.get("devin_id"),
+                issue=record["issue_number"],
+                outcome=current.get("outcome"),
+            )
+            return
         self.store.update(record["finding_key"], outcome=outcome, status_detail=note)
         final = self.store.get(record["finding_key"]) or record
         log_event(

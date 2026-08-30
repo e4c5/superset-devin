@@ -36,6 +36,14 @@ class Settings:
     session_max_wait_seconds: int = field(
         default_factory=lambda: _int_env("SESSION_MAX_WAIT_SECONDS", 3600)
     )
+    #: Per-session backoff: the gap after the Nth consecutive "still running" poll is
+    #: ``min(base * 2**N, cap)``. ``poll_interval_seconds`` stays the loop's base tick.
+    poll_backoff_base_seconds: int = field(
+        default_factory=lambda: _int_env("POLL_BACKOFF_BASE_SECONDS", 30)
+    )
+    poll_backoff_cap_seconds: int = field(
+        default_factory=lambda: _int_env("POLL_BACKOFF_CAP_SECONDS", 300)
+    )
     database_path: str = field(default_factory=lambda: os.getenv("DATABASE_PATH", "data/state.db"))
     report_path: str = field(default_factory=lambda: os.getenv("REPORT_PATH", "data/report.md"))
     max_retries: int = field(default_factory=lambda: _int_env("MAX_RETRIES", 5))

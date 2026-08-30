@@ -129,3 +129,24 @@ def issue_payload(
     if action == "labeled":
         payload["label"] = {"name": label}
     return payload
+
+
+def pull_request_payload(
+    issue_number: int,
+    *,
+    number: int = 900,
+    action: str = "opened",
+    repo: str = "e4c5/superset",
+    rule: str = "typescript:S6440",
+) -> dict[str, Any]:
+    """A ``pull_request`` webhook for the PR Devin opens against an issue."""
+    return {
+        "action": action,
+        "repository": {"full_name": repo},
+        "pull_request": {
+            "number": number,
+            "title": f"fix({rule}): resolve SonarQube finding from issue #{issue_number}",
+            "body": f"Fixes the finding reported in issue #{issue_number}.",
+            "html_url": f"https://github.com/{repo}/pull/{number}",
+        },
+    }
