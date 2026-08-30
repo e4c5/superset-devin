@@ -1,0 +1,197 @@
+# superset-devin — event-driven SonarQube remediation on the Devin API v3
+
+A small orchestrator that turns a SonarQube finding filed as a GitHub issue into
+a Devin session that fixes it — or reasons about it and declines — and then
+reports the business numbers: success rate, PRs opened, ACUs burned, cost per
+fix.
+
+```
+GitHub issue (label: devin-fix)
+        │  issues webhook  (opened | labeled)
+        ▼
+   localtunnel  ──►  POST /webhook   (HMAC verified, 200 in <50ms)
+                          │ background task
+                          ▼
+                    dedup (atomic, SQLite)
+                     │            └── duplicate ─► comment on issue + skip counter
+                     ▼
+        POST /v3/organizations/{org}/sessions   (devin_id=devin-s6440-issue-<n>)
+                     │            └── 409 ─► fetch existing session, continue
+                     ▼
+                  poller  ──►  GET .../sessions/{devin_id}  every POLL_INTERVAL_SECONDS
+                     │
+                     ▼
+   succeeded / declined / failed / blocked_on_budget / timed_out
+                     │
+                     ▼
+        structured logs + GET /status + report.md
+```
+
+There is **no batch scan step**. The only way work starts is an `issues`
+webhook, so the demo is driven entirely by filing tickets on camera.
+
+## What is where
+
+| Path | Purpose |
+| --- | --- |
+| `app/webhook.py` | FastAPI service: `POST /webhook`, `GET /status`, `GET /report`, `GET /healthz` |
+| `app/orchestrator.py` | Label gate, dedup claim, prompt build, session create |
+| `app/findings.py` | Parses the issue body into a `Finding`; builds the per-issue prompt |
+| `app/devin_client.py` | Devin v3 client: backoff on 429/5xx, 409-as-idempotent, 401/403/422 handling |
+| `app/store.py` | SQLite state + **atomic** finding-level dedup |
+| `app/poller.py` | Non-terminal session polling, outcome classification, timeout, restart rehydration |
+| `app/metrics.py` | `/status` payload and `report.md` |
+| `backlog/sonar_S6440_issues.md` | The 5 demo findings, ready to file |
+| `playbooks/create-sonar-issue.md` | Playbook that opens one ticket per finding |
+| `simulator/`, `scripts/simulate.py` | Offline end-to-end run — no GitHub, no Devin, no tokens |
+
+## Run it for real
+
+### 1. Configure
+
+```bash
+cp .env.example .env
+$EDITOR .env      # DEVIN_SERVICE_USER_TOKEN, GITHUB_WEBHOOK_SECRET, GITHUB_TOKEN
+```
+
+The Devin service-user token (`cog_…`) needs **`UseDevinSessions`** to create
+sessions and **`ViewOrgSessions`** to poll them. Missing either shows up as a
+loud, non-retryable `401`/`403` that marks the issue `errored` and comments on
+it — it never silently stalls.
+
+### 2. Start the service
+
+```bash
+docker compose up --build      # serves on :8080, state persisted in ./data
+```
+
+Or without Docker:
+
+```bash
+make install
+make run                       # uvicorn app.webhook:app --port 8080
+curl -s localhost:8080/healthz
+```
+
+### 3. Expose it with localtunnel
+
+```bash
+npm install -g localtunnel
+lt --port 8080 --subdomain superset-devin
+# → https://superset-devin.loca.lt
+```
+
+### 4. Point GitHub at it
+
+On `e4c5/superset` → Settings → Webhooks → Add webhook:
+
+| Field | Value |
+| --- | --- |
+| Payload URL | `https://superset-devin.loca.lt/webhook` |
+| Content type | `application/json` |
+| Secret | the same string as `GITHUB_WEBHOOK_SECRET` |
+| Events | *Let me select individual events* → **Issues** only |
+
+Then create the `devin-fix` label on the repo. Issues without that label are
+acknowledged with 200 and ignored — the gate is enforced server-side, not by
+the webhook config.
+
+### 5. File tickets, one at a time
+
+Use [`playbooks/create-sonar-issue.md`](playbooks/create-sonar-issue.md) with
+the findings in [`backlog/sonar_S6440_issues.md`](backlog/sonar_S6440_issues.md)
+(that file also has the suggested on-camera order, including the duplicate
+ticket that demonstrates dedup).
+
+### 6. Watch
+
+```bash
+docker compose logs -f orchestrator   # structured JSON-lines lifecycle events
+curl -s localhost:8080/status | jq    # live rollup
+curl -s localhost:8080/report         # the same as markdown
+cat data/report.md                    # rewritten on every terminal outcome
+```
+
+## Simulate the workflow (no tokens, no network)
+
+The simulation runs the **real** webhook app, orchestrator, store, client and
+poller against a fake Devin API and a fake GitHub, and deliberately exercises
+every resilience path:
+
+```bash
+make install
+make simulate            # or: .venv/bin/python -m scripts.simulate
+```
+
+It replays the five demo findings plus:
+
+- **Scenario A** — GitHub redelivers issue #101's webhook → no second session.
+- **Scenario B** — issue #106 repeats #101's SonarQube key → skipped, commented, counted.
+- a **cold replica** whose empty store forces a create against an already-existing
+  `devin_id` → the API returns **409** and the client reuses the session.
+- an **unlabeled** issue and a **closed** action → both ignored.
+- a **429** on create → retried with backoff.
+- a **503** on a poll → session stays `in_progress`, retried next tick (never mis-marked failed).
+- a session stopped by the ACU cap → `blocked_on_budget`, not `failed`.
+- the ECharts false positive → `declined` with a reason, no PR.
+
+Expected tail of the run:
+
+| Metric | Value |
+| --- | --- |
+| Issues addressed | 5 |
+| succeeded / declined / blocked_on_budget | 3 / 1 / 1 |
+| failed / timed_out | 0 / 0 |
+| Success rate | 60% |
+| PRs opened | 3 |
+| Total ACUs | 18.5 |
+| **Cost per fix** | 6.17 ACU/PR |
+| Duplicates ignored | 2 (1 redelivery, 1 same finding) |
+| Sessions reused via 409 | 1 |
+
+## Tests
+
+```bash
+make test    # 30 tests
+make lint
+```
+
+They cover HMAC rejection, the label/action/event gate, markdown parsing and the
+`(file, rule)` fallback, concurrent claims of the same finding, 409 reuse, 429
+retry, 5xx exhaustion, non-retryable 401/403/422, the create-request contract,
+every outcome bucket, transient-poll-failure-is-not-failure, timeout, restart
+rehydration, and the metrics rollup.
+
+## Design notes
+
+**Two kinds of duplicate, two defences.** A redelivered webhook is caught by the
+deterministic `devin_id` (`devin-s6440-issue-<n>`) — even if our store were
+wiped, the Devin API answers `409` and we adopt the existing session. The same
+defect filed as two issues is caught by the SonarQube issue key (falling back to
+`(file, rule)`), which is a `PRIMARY KEY` claimed under `BEGIN IMMEDIATE`, so two
+simultaneous webhooks cannot both win the check-and-insert.
+
+**Unreachable ≠ errored.** The poller only marks a session `failed` when the API
+*reports* `status == "error"`. A network error or 5xx on the GET leaves the
+session non-terminal and it is retried on the next tick; the per-session
+`SESSION_MAX_WAIT_SECONDS` deadline is what eventually resolves it as
+`timed_out`.
+
+**A budget stop is not a defect.** `status == "suspended"` with an
+out-of-credits/usage-limit detail, or hitting `MAX_ACU_LIMIT`, is its own
+`blocked_on_budget` bucket, so cost caps never pollute the failure rate.
+
+**Declining is a result.** A terminal session with `fixed == false` is
+`declined`, not a failure — finding 5 is a genuine false positive and the
+demo's point is that Devin says so instead of "fixing" it.
+
+**Restart durability.** All state is in SQLite; on startup the poller rehydrates
+every non-terminal record, so `docker compose restart` mid-demo loses nothing.
+
+## Security
+
+No secrets in the repo — `.env` is gitignored and `.env.example` holds
+placeholders only. Tokens are read from the environment, sent as bearer headers,
+and never logged. `X-Hub-Signature-256` is compared with `hmac.compare_digest`,
+and an unsigned or wrongly-signed request is rejected with 401 before the body
+is parsed.
