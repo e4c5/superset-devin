@@ -133,6 +133,28 @@ def test_webhook_endpoint_gating(tmp_path):
         assert "SonarQube auto-remediation" in client.get("/report").text
 
 
+def test_status_endpoints_require_token_when_configured(tmp_path):
+    settings, store, _, _, fake_devin, fake_github = build_stack(tmp_path, status_token="tok")
+    app = build_app(
+        settings,
+        devin_client=DevinClient(
+            base_url=settings.devin_api_base, org_id=ORG, token="cog_test",
+            transport=fake_devin.transport(), backoff_base=0.001,
+        ),
+        github_client=GitHubClient(token="ghp_test", repo=settings.target_repo,
+                                   transport=fake_github.transport()),
+        store=store,
+        start_poller=False,
+    )
+    with TestClient(app) as client:
+        assert client.get("/healthz").status_code == 200
+        assert client.get("/status").status_code == 401
+        assert client.get("/report").status_code == 401
+        auth = {"Authorization": "Bearer tok"}
+        assert client.get("/status", headers=auth).status_code == 200
+        assert client.get("/report", headers=auth).status_code == 200
+
+
 def test_gate_rejects_foreign_repository_and_unrelated_labels(tmp_path):
     _, _, orch, _, _, _ = build_stack(tmp_path)
 

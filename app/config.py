@@ -39,6 +39,9 @@ class Settings:
     database_path: str = field(default_factory=lambda: os.getenv("DATABASE_PATH", "data/state.db"))
     report_path: str = field(default_factory=lambda: os.getenv("REPORT_PATH", "data/report.md"))
     max_retries: int = field(default_factory=lambda: _int_env("MAX_RETRIES", 5))
+    #: When set, /status and /report require ``Authorization: Bearer <token>``.
+    #: The tunnelled service is world-reachable, so set it for anything but a local demo.
+    status_token: str = field(default_factory=lambda: os.getenv("STATUS_TOKEN", ""))
     dry_run: bool = field(
         default_factory=lambda: os.getenv("DRY_RUN", "false").lower() in {"1", "true", "yes"}
     )

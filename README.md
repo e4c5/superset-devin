@@ -196,4 +196,6 @@ and never logged. `X-Hub-Signature-256` is compared with `hmac.compare_digest`,
 and an unsigned or wrongly-signed request is rejected with 401 before the body
 is parsed. A correctly-signed payload is still dropped unless
 `repository.full_name` is `TARGET_REPO`, so a secret shared with another repo's
-webhook cannot aim sessions at the fork.
+webhook cannot aim sessions at the fork. `/status` and `/report` expose finding
+paths, PR links and costs; set `STATUS_TOKEN` to require
+`Authorization: Bearer <token>` on them whenever the tunnel URL is public.

@@ -100,13 +100,23 @@ def build_app(
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
 
+    def authorized(header: str | None) -> bool:
+        """Reports carry finding paths, PRs and costs; gate them when a token is set."""
+        if not settings.status_token:
+            return True
+        return bool(header) and hmac.compare_digest(header, f"Bearer {settings.status_token}")
+
     @app.get("/status")
-    async def status() -> JSONResponse:
+    async def status(authorization: str | None = Header(default=None)) -> JSONResponse:
+        if not authorized(authorization):
+            return JSONResponse({"detail": "unauthorized"}, status_code=401)
         return JSONResponse(build_metrics(state_store))
 
     @app.get("/report", response_class=PlainTextResponse)
-    async def report() -> str:
-        return render_report(build_metrics(state_store))
+    async def report(authorization: str | None = Header(default=None)) -> Response:
+        if not authorized(authorization):
+            return PlainTextResponse("unauthorized", status_code=401)
+        return PlainTextResponse(render_report(build_metrics(state_store)))
 
     @app.post("/webhook")
     async def webhook(
