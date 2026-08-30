@@ -169,10 +169,23 @@ class FakeGitHubAPI:
     """Captures issue comments so the demo can show dedup feedback."""
 
     comments: list[tuple[int, str]] = field(default_factory=list)
+    #: issue number -> "open" | "closed"
+    issue_states: dict[int, str] = field(default_factory=dict)
+    #: pull request number -> (state, merged)
+    pull_states: dict[int, tuple[str, bool]] = field(default_factory=dict)
 
     def transport(self) -> httpx.MockTransport:
         def handle(request: httpx.Request) -> httpx.Response:
             parts = request.url.path.strip("/").split("/")
+            if request.method == "GET":
+                if "pulls" in parts:
+                    number = int(parts[parts.index("pulls") + 1])
+                    state, merged = self.pull_states.get(number, ("open", False))
+                    return httpx.Response(200, json={"number": number, "state": state, "merged": merged})
+                number = int(parts[parts.index("issues") + 1])
+                return httpx.Response(
+                    200, json={"number": number, "state": self.issue_states.get(number, "open")}
+                )
             issue_number = int(parts[parts.index("issues") + 1])
             body = json.loads(request.content or b"{}").get("body", "")
             self.comments.append((issue_number, body))

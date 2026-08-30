@@ -184,6 +184,17 @@ snapshotted at that tick — a Devin session often keeps running in
 time would distort cost-per-fix. Set `TERMINAL_ON_PR=false` to wait for the
 session's own `exit`/`finished` instead.
 
+**Dedup blocks a live fix, not a dead one.** A finding stays claimed only while
+its fix is real. When the same finding is filed again, the orchestrator asks
+GitHub about the previous attempt: if its pull request was closed without being
+merged, or the earlier issue was closed with nothing merged, the defect is still
+in the tree, so the claim is re-opened (guarded by the record's `updated_at`, so
+two racing refiles cannot both take it) and a fresh session starts under the new
+issue number. A merged PR, an open PR, or a session still running still wins the
+dedup and the new issue just gets a pointer comment. If GitHub cannot be
+reached, the finding stays deduped — a refile is cheap to repeat, a duplicate
+session is not.
+
 **A budget stop is not a defect.** `status == "suspended"` with an
 out-of-credits/usage-limit detail, or hitting `MAX_ACU_LIMIT`, is its own
 `blocked_on_budget` bucket, so cost caps never pollute the failure rate.
