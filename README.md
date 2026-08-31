@@ -34,7 +34,9 @@ GitHub issue (label: devin-fix)
 There is **no batch scan step**. The only way work *starts* is an `issues`
 webhook, so the demo is driven entirely by filing tickets on camera. A
 `pull_request` webhook never starts anything — it only settles a session that is
-already being tracked.
+already being tracked. That webhook is the success path; the background poller
+only determines an outcome for sessions that never open a PR (declined, failed,
+blocked_on_budget, timed_out), and as a backstop when the PR webhook is absent.
 
 ## What is where
 
@@ -212,19 +214,24 @@ defect filed as two issues is caught by the SonarQube issue key (falling back to
 `(file, rule)`), which is a `PRIMARY KEY` claimed under `BEGIN IMMEDIATE`, so two
 simultaneous webhooks cannot both win the check-and-insert.
 
-**How completion is detected.** The poller is the source of truth and the
-backstop; nothing else writes a terminal outcome. It wakes every
-`POLL_INTERVAL_SECONDS` but each session carries its own `next_poll_at`, widened
-to `min(POLL_BACKOFF_BASE_SECONDS * 2**attempts, POLL_BACKOFF_CAP_SECONDS)` after
-every poll that finds the session still running — so an hour-long session costs a
-handful of GETs rather than 120. The `pull_request` webhook is a low-latency
-shortcut on the happy path only: it maps the PR back to the issue it references,
-and if that record is still non-terminal it runs one `get_session` through the
-same `classify` → `store.update` → finalize path a poll tick would. Both paths
+**The PR webhook is the happy path; polling is the failure path.**
+A session that fixes the finding announces itself — Devin opens a pull request,
+the `pull_request` webhook maps it back to its issue, and one `get_session`
+settles it as `succeeded` (`TERMINAL_ON_PR=true`). No polling in the success
+case.
+
+Polling exists for the outcomes with no event to hang off: Devin declining the
+finding, erroring, hitting the ACU cap, or going silent. The poller wakes every
+`POLL_INTERVAL_SECONDS`, but each still-running session carries its own
+`next_poll_at`, widened to `min(POLL_BACKOFF_BASE_SECONDS * 2**attempts,
+POLL_BACKOFF_CAP_SECONDS)` per attempt — an hour-long session costs a handful of
+GETs, not 120. `SESSION_MAX_WAIT_SECONDS` force-resolves a silent session as
+`timed_out`.
+
+The poller is also the backstop: if the `pull_request` webhook is absent or
+delayed, a successful session still resolves on the next poll. Both the webhook
+and the poll tick run the same `classify` → `store.update` → finalize path and
 re-read the record before finalizing, so a webhook racing a tick reports once.
-Outcomes with no event to hang off (`declined`, `blocked_on_budget`, `failed`)
-simply resolve on the slower poll, and `SESSION_MAX_WAIT_SECONDS` still force-
-resolves a silent session as `timed_out`.
 
 **Unreachable ≠ errored.** The poller only marks a session `failed` when the API
 *reports* `status == "error"`. A network error or 5xx on the GET leaves the
